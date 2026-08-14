@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bin/up — sobe a infra do ai-hub (LiteLLM porta 4001 + fcc-server porta 8084).
+# Rode de qualquer terminal (symlink: ~/.local/bin/ai-up).
+# Depois, em OUTRO terminal: ai-code   (abre o cliente fcc-claude)
+# Ctrl-C aqui para parar tudo. (Ou: ai-down)
+# =============================================================================
+set -euo pipefail
+
+# Resolve o symlink (ai-up/ai-down/ai-code são symlinks em ~/.local/bin)
+SELF="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+mkdir -p "$ROOT/logs"
+
+VENV="$ROOT/.venv"
+if [ ! -d "$VENV" ]; then
+  echo "❌ Sem ambiente configurado. Rode primeiro: $ROOT/setup.sh"
+  exit 1
+fi
+
+# ── Chaves (env/.env.free) ───────────────────────────────────────────────────
+if [ -f "$ROOT/env/.env.free" ]; then
+  set -a; source "$ROOT/env/.env.free"; set +a
+fi
+# Defaults seguros: sem valor → placeholder (evita crash de os.environ/None)
+NIM_API_KEY="${NIM_API_KEY:-sk-NAO-CONFIGURADO}"
+GEMINI_API_KEY="${GEMINI_API_KEY:-sk-NAO-CONFIGURADO}"
+MISTRAL_API_KEY="${MISTRAL_API_KEY:-sk-NAO-CONFIGURADO}"
+
+missing=0
+for k in NIM_API_KEY GEMINI_API_KEY MISTRAL_API_KEY; do
+  if [ "${!k}" = "sk-NAO-CONFIGURADO" ]; then
+    echo "⚠  $k não configurada (env/.env.free)"
+    missing=1
+  fi
+done
+[ "$missing" = 1 ] && echo "   Requests vão falhar até preencher as chaves."
+
+# ── Ponte Anthropic → chat/completions + patch de thinking ───────────────────
+export LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES=true
+"$VENV/bin/python" "$ROOT/scripts/patch-litellm-thinking.py" || true
+
+# ── Roteador: omniroute (fase 2) | direct (fase 1, rollback) ─────────────────
+# AIHUB_ROUTER=direct ai-up  → usa config/litellm.yaml.phase1.bak (NIM direto)
+AIHUB_ROUTER="${AIHUB_ROUTER:-omniroute}"
+LITELLM_CONFIG="$ROOT/config/litellm.yaml"
+[ "$AIHUB_ROUTER" = "direct" ] && LITELLM_CONFIG="$ROOT/config/litellm.yaml.phase1.bak"
+
+OMNIROUTE_PID=""
+
+# ── OmniRoute (porta 20128) — gateway free-tier (fallback + telemetria) ──────
+if [ "$AIHUB_ROUTER" = "omniroute" ]; then
+  if [ -f "$ROOT/env/.env.omniroute" ]; then
+    set -a; source "$ROOT/env/.env.omniroute"; set +a
+  else
+    echo "⚠  env/.env.omniroute não existe — rode: $ROOT/setup.sh"
+  fi
+  OMNIROUTE_PORT="${OMNIROUTE_PORT:-20128}"
+  OMNIROUTE_SERVER_HOST="${OMNIROUTE_SERVER_HOST:-127.0.0.1}"
+  OMNIROUTE_API_KEY="${OMNIROUTE_API_KEY:-sk-NAO-CONFIGURADO}"
+  # INITIAL_PASSWORD é o que o servidor usa para GRAVAR a senha do dashboard
+  # quando o DB nasce no 1º boot (o `omniroute setup` do CLI envenena o DB com
+  # migration tracking em '001' — o servidor aborta; ele mesmo cria o DB com as
+  # 130 migrações). Em boots seguintes setupComplete=true → variável ignorada.
+  export DATA_DIR OMNIROUTE_SERVER_HOST OMNIROUTE_PORT OMNIROUTE_API_KEY REQUIRE_API_KEY \
+    INITIAL_PASSWORD="${OMNIROUTE_ADMIN_PASSWORD:-${INITIAL_PASSWORD:-}}"
+
+  # ── 1º boot: deixa o SERVIDOR criar o DB (senão vira DB envenenado) ────────
+  # O seeder (`openOmniRouteDb`) cria um DB minimalista sem as 130 migrações do
+  # servidor → MigrationSafetyAbortError no boot. Então: se o DB não existe, o
+  # serve sobe primeiro (cria o DB completo + senha admin via INITIAL_PASSWORD),
+  # é derrubado, o seed grava as chaves, e o serve sobe de novo. Boots seguintes
+  # (DB já existe): seed antes do serve, direto.
+  OMNIROUTE_DB="$DATA_DIR/storage.sqlite"
+  if [ "$AIHUB_ROUTER" = "omniroute" ] && [ ! -f "$OMNIROUTE_DB" ]; then
+    echo "▶ OmniRoute: 1º boot — servidor cria o DB (migrações + senha admin)..."
+    omniroute serve --port "$OMNIROUTE_PORT" --no-open >"$ROOT/logs/omniroute.log" 2>&1 &
+    FIRST_PID=$!
+    ok=0
+    for i in $(seq 1 120); do
+      curl -sf -m 2 -H "Authorization: Bearer $OMNIROUTE_API_KEY" \
+        "http://127.0.0.1:$OMNIROUTE_PORT/v1/models" >/dev/null 2>&1 && { ok=1; break; }
+      sleep 1
+    done
+    if [ "$ok" != 1 ]; then
+      echo "❌ OmniRoute não subiu no 1º boot (log: logs/omniroute.log)."
+      kill "$FIRST_PID" 2>/dev/null || true
+      exit 1
+    fi
+    # Mata o wrapper + filho (mesma lógica do ai-down)
+    pkill -f "omniroute serve --port $OMNIROUTE_PORT" 2>/dev/null
+    kill "$FIRST_PID" 2>/dev/null || true
+    sleep 1
+    echo "   DB criado ($(ls -la "$OMNIROUTE_DB" 2>/dev/null | awk '{print $5}') bytes) — segue pro seed."
+  fi
+
+  # 2) Semeia as chaves dos provedores no SQLite (idempotente), ANTES do serve
+  #    Via seed-omniroute-keys.mjs (o `keys add` do CLI rejeita nvidia/gemini —
+  #    o parser do catálogo falha na estrutura de providers.ts e usa um fallback
+  #    de 6 ids; o seeder grava direto com a função oficial do próprio CLI).
+  node "$ROOT/scripts/seed-omniroute-keys.mjs" \
+    || echo "   ⚠  seed de chaves falhou (veja acima)"
+
+  # 3) Sobe o gateway
+  echo "▶ OmniRoute (free-tier gateway) em http://127.0.0.1:$OMNIROUTE_PORT"
+  omniroute serve --port "$OMNIROUTE_PORT" --no-open >"$ROOT/logs/omniroute.log" 2>&1 &
+  OMNIROUTE_PID=$!
+
+  ok=0
+  for i in $(seq 1 90); do
+    curl -sf -m 2 -H "Authorization: Bearer $OMNIROUTE_API_KEY" \
+      "http://127.0.0.1:$OMNIROUTE_PORT/v1/models" >/dev/null 2>&1 && { ok=1; break; }
+    sleep 1
+  done
+  if [ "$ok" != 1 ]; then
+    echo "❌ OmniRoute não subiu (log: logs/omniroute.log)."
+    kill "$OMNIROUTE_PID" 2>/dev/null || true
+    exit 1
+  fi
+  echo "   OmniRoute ok (PID $OMNIROUTE_PID)"
+
+  # 4) Combo "free-agent" (priority NIM→Gemini→Mistral) — idempotente
+  if omniroute combo list --json 2>/dev/null | grep -q '"free-agent"'; then
+    echo "   combo free-agent já existe — ok."
+  else
+    COMBO_JSON='{"name":"free-agent","description":"NIM→Gemini→Mistral (priority)","strategy":"priority","models":["nvidia/deepseek-ai/deepseek-v4-flash-0731","gemini/gemini-3.5-flash","mistral/mistral-medium-3-5"],"config":{"maxRetries":0}}'
+    omniroute api combos post-api-combos --body "$COMBO_JSON" >/dev/null 2>&1 \
+      && echo "   combo free-agent criado (priority)." \
+      || echo "   ⚠  não consegui criar o combo (veja logs/omniroute.log)."
+  fi
+fi
+
+# ── LiteLLM (porta 4001) ─────────────────────────────────────────────────────
+echo "▶ LiteLLM (Anthropic → free APIs) em http://127.0.0.1:4001"
+"$VENV/bin/litellm" \
+  --config "$LITELLM_CONFIG" \
+  --port 4001 \
+  --host 127.0.0.1 >"$ROOT/logs/litellm.log" 2>&1 &
+LITELLM_PID=$!
+
+ok=0
+for i in $(seq 1 60); do
+  curl -sf -m 2 http://127.0.0.1:4001/v1/models >/dev/null 2>&1 && { ok=1; break; }
+  sleep 1
+done
+if [ "$ok" != 1 ]; then
+  echo "❌ LiteLLM não subiu (log: logs/litellm.log)."
+  kill "$LITELLM_PID" "$OMNIROUTE_PID" 2>/dev/null || true
+  exit 1
+fi
+echo "   LiteLLM ok (PID $LITELLM_PID)"
+
+# ── fcc-server (porta 8084) ───────────────────────────────────────────────────
+echo "▶ fcc-server (porta 8084)"
+FCC_ENV_FILE="$ROOT/env/fcc-aihub.env" \
+LOG_FILE="$ROOT/logs/fcc-aihub.log" \
+FCC_OPEN_BROWSER=false \
+fcc-server >/dev/null 2>&1 &
+FCC_PID=$!
+
+ok=0
+for i in $(seq 1 30); do
+  curl -sf -m 2 http://127.0.0.1:8084/health >/dev/null 2>&1 && { ok=1; break; }
+  sleep 1
+done
+if [ "$ok" != 1 ]; then
+  echo "❌ fcc-server não subiu (log: logs/fcc-aihub.log)."
+  kill "$OMNIROUTE_PID" "$LITELLM_PID" "$FCC_PID" 2>/dev/null || true
+  exit 1
+fi
+echo "   fcc-server ok (PID $FCC_PID)"
+
+# ── Shutdown limpo no Ctrl-C ─────────────────────────────────────────────────
+# OmniRoute: mata também o wrapper por nome — o serve spawna um filho (o
+# servidor real) e, se só o PID salvo morrer, o supervisor pode respawnar.
+trap 'echo; echo "⏹  Parando..."; pkill -f "omniroute serve --port 20128" 2>/dev/null; kill "$OMNIROUTE_PID" "$LITELLM_PID" "$FCC_PID" 2>/dev/null || true; wait 2>/dev/null || true' INT TERM
+
+cat <<EOF
+
+✅ ai-hub no ar.
+   OmniRoute  → http://127.0.0.1:20128/v1/models  (dashboard: http://127.0.0.1:20128)
+   LiteLLM    → http://127.0.0.1:4001/v1/models
+   fcc-server → http://127.0.0.1:8084/health
+
+   Em OUTRO terminal, abra o cliente:
+     ai-code
+
+   (Ctrl-C aqui para parar tudo · ou ai-down de qualquer lugar)
+EOF
+
+wait

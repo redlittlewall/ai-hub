@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bin/down — para a infra do ai-hub (LiteLLM 4001 + fcc-server 8084).
+# Mata SÓ pelas portas do ai-hub — não mexe nas instâncias 4000/8082/8083.
+# =============================================================================
+set -euo pipefail
+
+# Resolve o symlink (ai-down é symlink em ~/.local/bin)
+SELF="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+
+# OmniRoute tem wrapper pai + listener filho: o `omniroute serve` é um node que
+# spawna um filho (o servidor real). Matar só a porta deixa o pai vivo e o
+# supervisor respawna o filho. Mata o wrapper PELO NOME antes das portas.
+pkill -f "omniroute serve --port 20128" 2>/dev/null && echo "⏹  omniroute serve (wrapper): morto"
+sleep 1
+
+for port in 20128 4001 8084; do
+  pids="$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+  if [ -n "$pids" ]; then
+    kill $pids 2>/dev/null || true
+    echo "⏹  porta $port: PID(s) $pids"
+  else
+    echo "   porta $port: nada rodando"
+  fi
+done
+
+# Espera as portas liberarem de fato (fcc-server pode demorar um instante)
+for port in 20128 4001 8084; do
+  for i in $(seq 1 15); do
+    [ -z "$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)" ] && break
+    sleep 1
+  done
+  if [ -n "$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)" ]; then
+    echo "⚠  porta $port ainda ocupada — force com: kill \$(lsof -tiTCP:$port -sTCP:LISTEN)"
+  fi
+done
+
+echo "✅ ai-hub parado."

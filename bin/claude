@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bin/claude — abre o cliente free-claude-code do ai-hub (porta 8084).
+# Requer a infra no ar (ai-up). Symlink: ~/.local/bin/ai-code
+# =============================================================================
+set -euo pipefail
+
+# Resolve o symlink (ai-code é symlink em ~/.local/bin)
+SELF="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+
+# Confirma que o server está no ar
+if ! curl -sf -m 2 http://127.0.0.1:8084/health >/dev/null 2>&1; then
+  echo "❌ fcc-server (8084) não está no ar. Rode antes: ai-up"
+  exit 1
+fi
+
+exec env \
+  FCC_ENV_FILE="$ROOT/env/fcc-aihub.env" \
+  PORT=8084 \
+  fcc-claude

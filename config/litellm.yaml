@@ -1,0 +1,48 @@
+# =============================================================================
+# litellm.yaml — ai-hub: ponte Anthropic (/v1/messages do free-claude-code)
+# → free LLM APIs. Porta 4001 (a do stack local ~/Documents/LLM é 4000 — não
+# colidem).
+#
+# Rota "free-agent": NVIDIA NIM deepseek-v4-flash (PRIMÁRIO — o mesmo modelo
+# do dia a dia do usuário, grátis) com fallback automático para Gemini 3.5
+# Flash e Mistral Medium quando o primário falha/estoura quota.
+#
+# Iniciado por: bin/up   (exporta LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES=true
+#                        e as chaves NIM/GEMINI/MISTRAL_API_KEY do env/.env.free)
+# Chaves: NIM_API_KEY, GEMINI_API_KEY, MISTRAL_API_KEY  (env/.env.free)
+#
+# Todos os backends usam prefixo "openai/" (são OpenAI-compatíveis) — o mesmo
+# caminho já validado no stack local (flag + patch). Sem Responses API.
+# =============================================================================
+
+model_list:
+  # ── ROTA VIA OMNIROUTE (porta 20128) ──────────────────────────────────────
+  # LiteLLM continua sendo a ponte Anthropic → chat/completions. O fallback
+  # NIM→Gemini→Mistral agora é o combo "free-agent" (strategy=priority) no
+  # OmniRoute. A chave OMNIROUTE_API_KEY (gerada pelo setup.sh em
+  # env/.env.omniroute) autentica o LiteLLM no gateway (REQUIRE_API_KEY=true).
+  # Rollback p/ fase 1 (direto na NIM): AIHUB_ROUTER=direct ai-up.
+  - model_name: free-agent
+    litellm_params:
+      model: openai/free-agent                 # nome do combo no OmniRoute
+      api_base: http://127.0.0.1:20128/v1
+      api_key: os.environ/OMNIROUTE_API_KEY
+    # fallbacks REMOVIDOS — o combo priority no OmniRoute cobre NIM→Gemini→Mistral
+
+  # ── Modelo "pequeno" (títulos de conversa, resumos do fcc) ────────────────
+  # Pinado no NIM via OmniRoute — títulos são curtos, custo irrelevante.
+  - model_name: free-agent-small
+    litellm_params:
+      model: openai/nvidia/deepseek-ai/deepseek-v4-flash-0731
+      api_base: http://127.0.0.1:20128/v1
+      api_key: os.environ/OMNIROUTE_API_KEY
+
+litellm_settings:
+  drop_params: true        # ignora params que o backend free não suporta
+  num_retries: 0           # sem retry automático (evita tool calls duplicadas)
+  request_timeout: 300     # segundos — contexto grande + fallback podem demorar
+
+router_settings:
+  # Circuit-breaker por deployment: cooldown curto + só cooldown após N falhas
+  cooldown_time: 5
+  allowed_fails: 3

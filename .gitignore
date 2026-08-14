@@ -1,0 +1,13 @@
+# venv e cache
+.venv/
+__pycache__/
+
+# chaves de API — NUNCA commitar
+env/.env.free
+env/.env.omniroute
+
+# dados locais (OmniRoute: SQLite + .env gerado)
+data/
+
+# logs
+logs/
